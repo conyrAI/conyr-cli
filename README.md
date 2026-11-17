@@ -1,4 +1,4 @@
-# conyr
+# conyr-cli
 
 Solana coin checks from the command line, answered by Conyr's API: whether coordinated groups of wallets (bundles)
 are on a coin and still open, and what kinds of wallets are buying it. With a key of your own, any other route of the
@@ -9,8 +9,10 @@ API: holders, liquidity, wallets, clusters.
 No signup and nothing to set up, with Node.js 22 or later:
 
 ```bash
-npx -y conyr token DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263
+npx -y conyr-cli token DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263
 ```
+
+Installed with `npm install -g conyr-cli`, the command is `conyr`.
 
 ```
 Coin     DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263

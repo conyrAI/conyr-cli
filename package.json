@@ -1,5 +1,5 @@
 {
-  "name": "conyr",
+  "name": "conyr-cli",
   "version": "1.0.0",
   "description": "Solana coin checks from Conyr's API: coordinated wallet bundles on a coin and the kinds of wallets buying it, free with no signup. Any /v1 route with a key.",
   "keywords": [
