@@ -1,0 +1,343 @@
+#!/usr/bin/env node
+// Run before every release of the conyr package, after `npm run build`. It fails when:
+//   link-tags    a conyr.ai link in README.md or package.json lacks the npm page's tags
+//   link-status  a conyr.ai address in README.md, package.json or the built tool does not answer 200
+//                (the tool's own addresses are fetched with the tags the tool adds to them)
+//   route        a /v1 route named in README.md, the help text or the source is missing from Conyr's live OpenAPI file
+//   plan         a plan named on the same line as a route is not the plan the OpenAPI file gives that route
+//   package      package.json has a dependency, a script that runs on install, a bin outside the built folder,
+//                or a files list other than the built folder
+//   pack         `npm pack --dry-run` lists a file other than the built files, README.md, LICENSE and package.json,
+//                or misses one of them
+//   version      the version in package.json differs from what the built tool prints for --version
+//   deny         (only with --deny <file>) a file in the repository, or the help text, holds a term from that list
+//
+// Usage: tools/check [repository directory] [--deny <file>]
+// Needs Node 22 or later, npm and network access. Exit 0: no problem. Exit 1: problems, one per line.
+// Exit 2: could not run.
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const OPENAPI_URL = 'https://conyr.ai/docs/openapi.yaml';
+const PLANS = ['Free', 'Layer 1', 'Layer 2', 'Layer 3'];
+const PLAN_RE = /\b(Free|Layer [123])\b/g;
+// Addresses an agent calls, not pages a person opens: no tags, and no status check (they need a key).
+const ENDPOINTS = new Set(['api.conyr.ai', 'mcp.conyr.ai']);
+// Fills a placeholder (<mint>, {mint}, ${mint}) when an address is fetched: BONK's mint.
+const EXAMPLE = 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263';
+const README_TAGS = { utm_source: 'npm', utm_medium: 'package', utm_content: 'conyr' };
+const TOOL_TAGS = { utm_source: 'cli', utm_medium: 'cli', utm_content: 'token' };
+const SOURCE = 'src';
+const BUILT = 'dist';
+const ALWAYS_PACKED = ['LICENSE', 'README.md', 'package.json'];
+const DEPENDENCY_FIELDS = ['dependencies', 'optionalDependencies', 'peerDependencies', 'bundleDependencies', 'bundledDependencies'];
+const INSTALL_SCRIPTS = ['preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
+const SKIP = new Set(['.git', 'node_modules', 'package-lock.json']);
+// A route as written in text or code: segments may be placeholders such as <mint>, {mint} or ${args.mint}.
+const ROUTE_RE = /\/v1(?:\/(?:\$\{[^}\n]+\}|[A-Za-z0-9_.$-]|\{[A-Za-z0-9_]+\}|<[A-Za-z0-9_ -]+>)+)+/g;
+const URL_RE = /https?:\/\/(?:[A-Za-z0-9._~:/?#@!$&*+,;=%-]|<[A-Za-z0-9_ -]+>|\{[A-Za-z0-9_]+\})+/g;
+
+const problems = [];
+const seen = new Set();
+function problem(rule, where, message) {
+  const line = `${rule}: ${where}: ${message}`;
+  if (seen.has(line)) return;
+  seen.add(line);
+  problems.push(line);
+}
+
+function stop(message) {
+  console.error(`check: ${message}`);
+  process.exit(2);
+}
+
+function parseArgs(argv) {
+  const args = { root: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'), deny: null };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--deny') {
+      args.deny = argv[++i];
+      if (!args.deny) stop('--deny needs a file');
+    } else if (argv[i].startsWith('-')) {
+      stop(`unknown option ${argv[i]}\nusage: tools/check [repository directory] [--deny <file>]`);
+    } else {
+      args.root = path.resolve(argv[i]);
+    }
+  }
+  return args;
+}
+
+function files(dir, root, out = []) {
+  if (!fs.existsSync(dir)) return out;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (SKIP.has(e.name)) continue;
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) files(p, root, out);
+    else if (e.isFile()) out.push(path.relative(root, p).split(path.sep).join('/'));
+  }
+  return out.sort();
+}
+
+const lineAt = (text, index) => text.slice(0, index).split('\n').length;
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const plainPath = (p) => p.replace(/^\.\//, '').replace(/\/+$/, '');
+
+// --- the built tool ------------------------------------------------------------------------------------------------
+
+function binTargets(pkg) {
+  if (typeof pkg.bin === 'string') return [plainPath(pkg.bin)];
+  if (pkg.bin && typeof pkg.bin === 'object') return Object.values(pkg.bin).map((v) => plainPath(String(v)));
+  return [];
+}
+
+function runTool(root, bin, arg) {
+  if (!bin || !fs.existsSync(path.join(root, bin))) return { ok: false, text: `${bin ?? 'no bin'} does not exist` };
+  const r = spawnSync(process.execPath, [path.join(root, bin), arg], { cwd: root, encoding: 'utf8', timeout: 30_000 });
+  if (r.status !== 0) return { ok: false, text: `${bin} ${arg} exited ${r.status}: ${(r.stderr || r.stdout).trim()}` };
+  return { ok: true, text: r.stdout };
+}
+
+// --- route and plan -----------------------------------------------------------------------------------------------
+
+// The GET operations under paths: in the OpenAPI file, with their x-tier. A small reader for this file's layout,
+// so the check needs nothing installed.
+function readOpenapi(yaml) {
+  const tiers = new Map();
+  let inPaths = false;
+  let route = null;
+  let method = null;
+  for (const line of yaml.split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith('#')) continue;
+    if (/^\S/.test(line)) {
+      inPaths = /^paths:\s*$/.test(line);
+      route = method = null;
+      continue;
+    }
+    if (!inPaths) continue;
+    let m;
+    if ((m = /^ {2}(['"]?)(\/[^'"\s]*)\1:\s*$/.exec(line))) [route, method] = [m[2], null];
+    else if ((m = /^ {4}([a-z]+):\s*$/.exec(line))) method = m[1];
+    else if (route && method === 'get' && (m = /^ {6}x-tier:\s*['"]?([^'"#]+?)['"]?\s*(?:#.*)?$/.exec(line))) {
+      tiers.set(route, m[1]);
+    }
+  }
+  return [...tiers]
+    .filter(([route]) => route.startsWith('/v1/'))
+    .map(([route, tier]) => {
+      const parts = route.split('/').slice(1);
+      const re = parts.map((p) => (/^\{[^}]+\}$/.test(p) ? '[^/]+' : escapeRe(p))).join('/');
+      return { route, tier, re: new RegExp(`^/${re}$`), literal: parts.filter((p) => !p.startsWith('{')).length };
+    });
+}
+
+// The OpenAPI route a written path stands for. A literal segment beats a parameter, as in the API's router.
+function routeOf(routes, written) {
+  let best = null;
+  for (const r of routes) if (r.re.test(written) && (!best || r.literal > best.literal)) best = r;
+  return best;
+}
+
+// Every route named in a text, and on each line that also names a plan, whether the plan is the route's.
+function checkRoutes(where, text, routes) {
+  let named = 0;
+  text.split('\n').forEach((line, i) => {
+    const plans = [...line.matchAll(PLAN_RE)].map((m) => m[1]);
+    for (const m of line.matchAll(ROUTE_RE)) {
+      const written = m[0].replace(/\.+$/, '');
+      if (/^\/v1\/?$/.test(written)) continue; // the bare prefix, as in "routes start with /v1/"
+      named++;
+      const r = routeOf(routes, written);
+      if (!r) problem('route', `${where}:${i + 1}`, `${written} is not in ${OPENAPI_URL}`);
+      else if (plans.length && !plans.includes(r.tier)) {
+        problem('plan', `${where}:${i + 1}`, `${r.route} is stated as ${plans.join(' or ')}, the OpenAPI file says ${r.tier}`);
+      }
+    }
+  });
+  return named;
+}
+
+// --- links --------------------------------------------------------------------------------------------------------
+
+const tagText = (tags) => Object.entries(tags).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join('&');
+// A file for machines (the OpenAPI contract, llms.txt) runs no script, so tags would count nothing.
+const forMachines = (url) => /\.(ya?ml|json|txt|md)$/i.test(url.pathname);
+
+function checkLinks(where, text, toFetch, { place, toolTags }) {
+  for (const m of text.matchAll(URL_RE)) {
+    const written = m[0].replace(/[.,;:!?*]+$/, '');
+    const line = lineAt(text, m.index);
+    let url;
+    try {
+      url = new URL(written.replace(/\$\{[^}]*\}|<[^>]+>|\{[A-Za-z0-9_]+\}/g, EXAMPLE));
+    } catch {
+      problem('link-status', `${where}:${line}`, `not a valid address: ${written}`);
+      continue;
+    }
+    if (url.hostname !== 'conyr.ai' && !url.hostname.endsWith('.conyr.ai')) continue;
+    if (ENDPOINTS.has(url.hostname)) continue;
+    if (!forMachines(url)) {
+      const got = Object.fromEntries([...url.searchParams].filter(([k]) => k.startsWith('utm_')));
+      if (place && tagText(got) !== tagText(place)) {
+        problem('link-tags', `${where}:${line}`, `${written} must carry exactly ${tagText(place)}`);
+      }
+      if (toolTags && !Object.keys(got).length) for (const [k, v] of Object.entries(toolTags)) url.searchParams.append(k, v);
+    }
+    if (!toFetch.has(url.href)) toFetch.set(url.href, []);
+    toFetch.get(url.href).push({ where: `${where}:${line}`, written });
+  }
+}
+
+async function statusOf(href) {
+  try {
+    const r = await fetch(href, {
+      redirect: 'manual',
+      headers: { 'user-agent': 'conyr-cli-check' },
+      signal: AbortSignal.timeout(20000),
+    });
+    await r.arrayBuffer().catch(() => null);
+    return r.status;
+  } catch (e) {
+    return `no answer (${e.cause?.code ?? e.name})`;
+  }
+}
+
+// --- package and pack ---------------------------------------------------------------------------------------------
+
+function checkPackage(pkg, root) {
+  for (const field of DEPENDENCY_FIELDS) {
+    const value = pkg[field];
+    const names = Array.isArray(value) ? value : Object.keys(value ?? {});
+    if (names.length) problem('package', 'package.json', `${field}: ${names.join(', ')} (the package must install nothing besides itself)`);
+  }
+  for (const name of INSTALL_SCRIPTS) {
+    if (pkg.scripts?.[name] !== undefined) problem('package', 'package.json', `scripts.${name} runs when the package is installed`);
+  }
+  const list = Array.isArray(pkg.files) ? pkg.files.map((f) => plainPath(String(f))) : null;
+  if (!list || list.length !== 1 || list[0] !== BUILT) {
+    problem('package', 'package.json', `files must be ["${BUILT}"], the built folder only (it is ${JSON.stringify(pkg.files ?? null)})`);
+  }
+  const bins = binTargets(pkg);
+  if (!bins.length) problem('package', 'package.json', 'no bin');
+  for (const bin of bins) {
+    if (!bin.startsWith(`${BUILT}/`) || !fs.existsSync(path.join(root, bin))) {
+      problem('package', 'package.json', `bin ${bin} is not a file in the built folder`);
+    }
+  }
+}
+
+function checkPack(root) {
+  const r = spawnSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    cwd: root, encoding: 'utf8', timeout: 120_000, shell: process.platform === 'win32',
+  });
+  if (r.error) stop(`cannot run npm: ${r.error.message}`);
+  let packed;
+  try {
+    packed = JSON.parse(r.stdout)[0].files.map((f) => f.path).sort();
+  } catch {
+    problem('pack', 'npm pack', `failed: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' ')}`);
+    return [];
+  }
+  const sources = files(path.join(root, SOURCE), root).filter((f) => f.endsWith('.ts') && !f.endsWith('.d.ts'));
+  const expected = new Set([...ALWAYS_PACKED, ...sources.map((f) => `${BUILT}/${f.slice(SOURCE.length + 1, -3)}.js`)]);
+  for (const f of packed) if (!expected.has(f)) problem('pack', f, 'is packed, but is not a built file, README.md, LICENSE or package.json');
+  for (const f of expected) if (!packed.includes(f)) problem('pack', f, 'is not packed');
+  return packed;
+}
+
+// --- deny ---------------------------------------------------------------------------------------------------------
+
+function denyPattern(file) {
+  let terms;
+  try {
+    terms = fs.readFileSync(file, 'utf8').split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  } catch (e) {
+    stop(`cannot read the deny list ${file}: ${e.message}`);
+  }
+  if (!terms.length) return { re: null, count: 0 };
+  const alt = terms.sort((a, b) => b.length - a.length).map(escapeRe).join('|');
+  return { re: new RegExp(`(?<![A-Za-z0-9_])(${alt})(?![A-Za-z0-9_])`, 'gi'), count: terms.length };
+}
+
+function checkDeny(where, text, re) {
+  for (const m of text.matchAll(re)) problem('deny', `${where}:${lineAt(text, m.index)}`, `"${m[1]}"`);
+}
+
+// --- main ---------------------------------------------------------------------------------------------------------
+
+async function main() {
+  const { root, deny } = parseArgs(process.argv.slice(2));
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+  } catch (e) {
+    stop(`no readable package.json in ${root}: ${e.message}`);
+  }
+  const denied = deny ? denyPattern(deny) : { re: null, count: 0 };
+
+  let yaml;
+  try {
+    const r = await fetch(OPENAPI_URL, { headers: { 'user-agent': 'conyr-cli-check' }, signal: AbortSignal.timeout(30000) });
+    if (r.status !== 200) stop(`${OPENAPI_URL} answered ${r.status}`);
+    yaml = await r.text();
+  } catch (e) {
+    stop(`cannot read ${OPENAPI_URL}: ${e.cause?.code ?? e.message}`);
+  }
+  const routes = readOpenapi(yaml);
+  if (!routes.length) stop(`found no /v1 route with an x-tier in ${OPENAPI_URL}`);
+
+  checkPackage(pkg, root);
+  const packed = checkPack(root);
+
+  const bin = binTargets(pkg)[0];
+  const version = runTool(root, bin, '--version');
+  if (!version.ok) problem('version', bin ?? 'package.json', version.text);
+  else if (version.text.trim() !== pkg.version) {
+    problem('version', bin, `prints ${JSON.stringify(version.text.trim())} for --version, package.json says ${pkg.version}`);
+  }
+  const help = runTool(root, bin, '--help');
+
+  const all = files(root, root);
+  const toFetch = new Map();
+  let named = 0;
+  for (const rel of all) {
+    const text = fs.readFileSync(path.join(root, rel), 'utf8');
+    const isSource = rel.startsWith(`${SOURCE}/`) && rel.endsWith('.ts');
+    const isBuilt = rel.startsWith(`${BUILT}/`) && rel.endsWith('.js');
+    if (rel === 'README.md' || isSource || isBuilt) named += checkRoutes(rel, text, routes);
+    if (rel === 'README.md' || rel === 'package.json') checkLinks(rel, text, toFetch, { place: README_TAGS });
+    if (isBuilt) checkLinks(rel, text, toFetch, { toolTags: TOOL_TAGS });
+    if (denied.re) checkDeny(rel, text, denied.re);
+  }
+  if (help.ok) {
+    named += checkRoutes('help text', help.text, routes);
+    if (denied.re) checkDeny('help text', help.text, denied.re);
+  } else {
+    problem('version', bin ?? 'package.json', `the help text could not be read: ${help.text}`);
+  }
+
+  const hrefs = [...toFetch.keys()];
+  for (let i = 0; i < hrefs.length; i += 4) {
+    const batch = hrefs.slice(i, i + 4);
+    const answers = await Promise.all(batch.map(statusOf));
+    batch.forEach((href, j) => {
+      if (answers[j] === 200) return;
+      for (const { where, written } of toFetch.get(href)) {
+        problem('link-status', where, `${written} answered ${answers[j]}${written === href ? '' : ` (fetched as ${href})`}`);
+      }
+    });
+  }
+
+  if (problems.length) {
+    console.log(problems.join('\n'));
+    console.log(`${problems.length} problem${problems.length === 1 ? '' : 's'}`);
+    process.exit(1);
+  }
+  console.log(
+    `ok: ${pkg.name} ${pkg.version}, ${packed.length} files packed, ${named} route mentions checked against ` +
+      `${routes.length} /v1 routes in ${OPENAPI_URL}, ${hrefs.length} conyr.ai addresses answered 200, ` +
+      (deny ? `deny list: ${denied.count} terms` : 'no deny list given'),
+  );
+}
+
+main();
