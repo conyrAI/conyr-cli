@@ -14,7 +14,8 @@ export interface KeyArgs {
 // A free route on a coin that always has an answer (BONK), to see whether the API accepts the key.
 const CHECK = '/v1/token/DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263/bundles/summary';
 
-// conyr key: which key, whether the API accepts it (a 429 means accepted and at its limit), and how to get one.
+// conyr key: which key, whether the API accepts it (a 429 means accepted and at its limit for the minute, or for the
+// month), and how to get one.
 export async function runKey(args: KeyArgs, io: Io): Promise<number> {
   const key = chooseKey(io.env);
   const place: Place = { command: 'key', via: args.via };
@@ -24,9 +25,13 @@ export async function runKey(args: KeyArgs, io: Io): Promise<number> {
   scan.stop();
   let accepted: boolean;
   let atLimit = false;
+  let monthLine: string | null = null;
   if (answer.ok) accepted = true;
-  else if (answer.failure.kind === 'status' && answer.failure.status === 429) [accepted, atLimit] = [true, true];
-  else if (answer.failure.kind === 'status' && answer.failure.status === 401) accepted = false;
+  else if (answer.failure.kind === 'status' && answer.failure.status === 429) {
+    [accepted, atLimit] = [true, true];
+    const refusal = refusalFor(answer.failure, key.kind, place);
+    if (refusal.reason === 'month_limit') monthLine = refusal.message;
+  } else if (answer.failure.kind === 'status' && answer.failure.status === 401) accepted = false;
   else return printRefusal(refusalFor(answer.failure, key.kind, place), key.kind, args.json, io);
 
   const links = { free_key: tagged(SIGN_UP, place), key_page: tagged(KEY_PAGE, place), plans: tagged(SIGN_UP, place) };
@@ -37,7 +42,7 @@ export async function runKey(args: KeyArgs, io: Io): Promise<number> {
   const which = key.kind === 'own' ? words.ownKey(key.value.slice(0, 16)) : words.demoKey;
   const verdict = !accepted
     ? key.kind === 'own' ? words.keyRefused() : words.demoKeyRetired()
-    : atLimit ? words.acceptedAtLimit : words.accepted;
+    : atLimit ? (monthLine === null ? words.acceptedAtLimit : words.acceptedAtMonthLimit(monthLine)) : words.accepted;
   io.stdout(words.keyReport(which, verdict, links));
   return 0;
 }

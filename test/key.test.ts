@@ -68,3 +68,12 @@ test('--via gives every link the skill tags', async () => {
   assert.ok(r.out.includes('https://conyr.ai/app/profile?tab=api&utm_source=skill&utm_medium=agent&utm_content=conyr-api'));
   assert.doesNotMatch(r.out, /utm_source=cli/);
 });
+
+test('a monthly-stop 429 on your own key: accepted, and the line says the month, not the minute', async () => {
+  const reply: Reply = { status: 429, body: { code: 429, error: 'Monthly free limit reached', limit: 10000, reason: 'month_limit', resets_at: '2026-12-01T00:00:00Z', retry_after_seconds: 1131712, upgrade_url: 'https://conyr.ai/app/profile?tab=api&plan=L1&utm_source=api&utm_medium=refusal&utm_content=month-limit', used: 10004 } };
+  const r = await cli(['key'], { env: OWN, replies: { [CHECK]: reply } });
+  assert.equal(r.code, 0);
+  assert.match(r.out, /month/i);
+  assert.doesNotMatch(r.out, /minute/i);
+  assert.deepEqual(json(await cli(['key', '--json'], { env: OWN, replies: { [CHECK]: reply } })), { ok: true, command: 'key', key: 'own', accepted: true, links: LINKS });
+});

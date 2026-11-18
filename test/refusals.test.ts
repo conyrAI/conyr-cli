@@ -3,6 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { cli, json, DEMO_KEY, MINT, VERSION, type Reply } from './helpers.ts';
+import { refusalFor } from '../src/refusals.ts';
 
 const OWN_KEY = 'conyr_live_madeUpKeyForTheTests00000000000';
 const OWN = { CONYR_API_KEY: OWN_KEY };
@@ -192,3 +193,61 @@ for (const [name, env, key, kind] of [
     assert.equal(call.headers['user-agent'], `conyr-cli/${VERSION}`);
   });
 }
+
+// The two kinds of 429 (API plans, spec 6.3 and 6.10): a body with reason "month_limit" is the monthly free stop, told
+// apart from the busy minute. The body below is the API's own answer at the monthly cap (local run of the API with its
+// start moved to 11-01, 2026-11-17).
+const place = { command: 'get', via: undefined };
+const MONTH_LINK = 'https://conyr.ai/app/profile?tab=api&plan=L1&utm_source=api&utm_medium=refusal&utm_content=month-limit';
+const MONTH_BODY = { code: 429, error: 'Monthly free limit reached', limit: 10000, reason: 'month_limit', resets_at: '2026-12-01T00:00:00Z', retry_after_seconds: 1131712, upgrade_url: MONTH_LINK, used: 10004 };
+
+test('a monthly stop is told apart from a busy minute', () => {
+  const r = refusalFor({ kind: 'status', status: 429, body: { code: 429, reason: 'month_limit', limit: 10000,
+    used: 10004, resets_at: '2026-12-01T00:00:00Z',
+    upgrade_url: 'https://conyr.ai/app/profile?tab=api&plan=L1&utm_source=api&utm_medium=refusal&utm_content=month-limit' } },
+    'own', place);
+  assert.equal(r.reason, 'month_limit');
+  assert.match(r.message, /10,000/);
+  assert.match(r.message, /10,004/);
+  assert.match(r.message, /2026-12-01/);
+  assert.doesNotMatch(r.message, /minute/i);
+  assert.equal(r.links.plans, 'https://conyr.ai/app/profile?tab=api&plan=L1&utm_source=api&utm_medium=refusal&utm_content=month-limit');
+});
+test('a link that is not Conyr is never printed', () => {
+  const r = refusalFor({ kind: 'status', status: 429, body: { reason: 'month_limit', upgrade_url: 'https://evil.example/x' } }, 'own', place);
+  assert.ok(r.links.plans?.startsWith('https://conyr.ai/'));
+});
+test('a Conyr link with hidden characters in it is never printed', () => {
+  const bad = 'https://conyr.ai/app\u001b]8;;https://evil.example/\u0007/profile';
+  const r = refusalFor({ kind: 'status', status: 429, body: { reason: 'month_limit', upgrade_url: bad } }, 'own', place);
+  assert.equal(r.reason, 'month_limit');
+  assert.equal(r.links.plans, 'https://conyr.ai/api?utm_source=cli&utm_medium=cli&utm_content=get');
+});
+test('a count or a date that does not read is left out of the line', () => {
+  const r = refusalFor({ kind: 'status', status: 429, body: { reason: 'month_limit', used: 10004.5, limit: -1, resets_at: 'soon' } }, 'own', place);
+  assert.equal(r.reason, 'month_limit');
+  assert.doesNotMatch(r.message, /10,00[45]|-1|soon|NaN|undefined|null|Invalid/);
+});
+test('a 429 with no reason is still the minute limit', () => {
+  assert.equal(refusalFor({ kind: 'status', status: 429, body: { code: 429, error: 'rate limit exceeded' } }, 'own', place).reason, 'rate_limit');
+});
+test('the demo key at a 429 is still "busy"', () => {
+  assert.equal(refusalFor({ kind: 'status', status: 429, body: { reason: 'minute_limit' } }, 'demo', place).reason, 'demo_key_busy');
+});
+
+test('token on a key at the monthly stop: the line and the link on stderr, no "wait a minute", exit 1', async () => {
+  const r = await cli(['token', MINT], { env: OWN, replies: { [SUMMARY]: { status: 429, body: MONTH_BODY } } });
+  assert.equal(r.code, 1);
+  assert.equal(r.out, '');
+  for (const fact of ['10,004', '10,000', '2026-12-01', MONTH_LINK]) assert.ok(r.err.includes(fact), `stderr says ${fact}:\n${r.err}`);
+  assert.doesNotMatch(r.err, /minute/i);
+  assert.equal(r.calls.length, 1, 'the second call is not sent');
+});
+
+test('token --json on a key at the monthly stop: one refusal document with the reason and the link', async () => {
+  const r = await cli(['token', MINT, '--json'], { env: OWN, replies: { [SUMMARY]: { status: 429, body: MONTH_BODY } } });
+  assert.equal(r.code, 1);
+  const doc = json(r);
+  assert.deepEqual(doc, { ok: false, status: 429, reason: 'month_limit', message: doc.message, key: 'own', links: { plans: MONTH_LINK } });
+  assert.ok(r.err.includes(doc.message));
+});

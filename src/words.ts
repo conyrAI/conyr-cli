@@ -16,6 +16,14 @@ export function plan(required: string | null, resolved: string | null, key: 'own
 
 export const rateLimit = () => 'Your key reached its limit for this minute. Wait a minute, or look at a higher plan.';
 
+// The monthly free stop. Each part is left out when the answer did not give it: the counts as printed numbers, the
+// day as YYYY-MM-DD.
+export function monthLimit(used: string | null, limit: string | null, resetsOn: string | null): string {
+  const amount = limit === null ? 'all of its' : used === null ? `its ${limit}` : `${used} of its ${limit}`;
+  const again = resetsOn === null ? 'on the 1st of next month (UTC)' : `on ${resetsOn} (UTC)`;
+  return `Your account has used ${amount} free calls this month. They start again ${again}, so retrying before then will not help.`;
+}
+
 export const demoKeyBusy = () =>
   'The shared demo key is at its limit for this minute; everyone without a key of their own shares it. Wait a minute, or get a free key of your own.';
 
@@ -141,6 +149,7 @@ export const ownKey = (prefix: string) => `The key in CONYR_API_KEY (${prefix}..
 export const demoKey = "Conyr's shared demo key (CONYR_API_KEY is not set)";
 export const accepted = 'Yes';
 export const acceptedAtLimit = 'Yes, and it is at its limit for this minute';
+export const acceptedAtMonthLimit = (monthLine: string) => `Yes. ${monthLine}`;
 
 export function keyReport(which: string, verdict: string, links: { free_key: string; key_page: string; plans: string }): string {
   return `Key       ${which}
